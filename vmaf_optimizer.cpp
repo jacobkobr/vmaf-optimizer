@@ -143,7 +143,11 @@ double measure_vmaf(const fs::path& original, const fs::path& encoded, const fs:
     // ffmpeg parses log_path as part of the filtergraph, where ':' and '\' both
     // mean something, so a windows path like C:\Users\... can't be passed in no
     // matter how you escape it. so: cd into the log folder and use a bare name.
-    std::string filter = "[0:v]setpts=PTS-STARTPTS[dist];[1:v]setpts=PTS-STARTPTS[ref];[dist][ref]libvmaf=log_fmt=json:log_path=" + log_file.filename().string();
+    // settb=AVTB,setpts=N pairs the two videos frame by frame instead of by
+    // timestamp. obs records slightly variable framerate and we encode to constant,
+    // so matching on timestamps lines frames up against their neighbours in places
+    // and tanks the score on content that is otherwise fine.
+    std::string filter = "[0:v]settb=AVTB,setpts=N[dist];[1:v]settb=AVTB,setpts=N[ref];[dist][ref]libvmaf=log_fmt=json:log_path=" + log_file.filename().string();
     std::string command = "ffmpeg -y -i \"" + encoded.string() + "\" -i \"" + original.string() + "\" -lavfi \"" + filter + "\" -f null -";
 
     fs::path previous_dir = fs::current_path();
@@ -325,6 +329,12 @@ int main(int argc, char** argv) {
         std::cout << "folder not found: " << settings.input_folder << "\n";
         return 1;
     }
+
+    // has to be absolute. measure_vmaf cds into the temp folder to run ffmpeg, and
+    // a relative --folder means every path we built off it stops resolving there.
+    std::error_code path_error;
+    fs::path full_path = fs::weakly_canonical(settings.input_folder, path_error);
+    settings.input_folder = path_error ? fs::absolute(settings.input_folder) : full_path;
 
     debug_logging = settings.debug;
     if (debug_logging) {
