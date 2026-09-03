@@ -12,7 +12,9 @@
 // other installs (postgres, swipl) ship older copies of the same ones that break it.
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,17 +24,24 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 #ifdef _WIN32
+  #include <io.h>
   #define POPEN _popen
   #define PCLOSE _pclose
+  #define ISATTY _isatty
+  #define FILENO _fileno
   static const char* DEV_NULL = "NUL";
 #else
+  #include <unistd.h>
   #define POPEN popen
   #define PCLOSE pclose
+  #define ISATTY isatty
+  #define FILENO fileno
   static const char* DEV_NULL = "/dev/null";
 #endif
 
@@ -68,6 +77,34 @@ struct ClipResult {
 // to keep handing the settings object down just for logging.
 static bool debug_logging = false;
 static fs::path debug_log_file;
+
+// ffmpeg can sit there for minutes with nothing to show, so spin a little marker
+// while we wait. skipped with --debug since that already prints as it goes, and
+// skipped when piped to a file since \r doesn't overwrite anything there.
+static std::atomic<bool> spinner_running(false);
+static std::thread spinner_thread;
+static std::string spinner_label;
+
+void start_spinner(const std::string& label) {
+    if (debug_logging || spinner_running || !ISATTY(FILENO(stdout))) return;
+    spinner_label = label;
+    spinner_running = true;
+    spinner_thread = std::thread([]() {
+        const char frames[] = {'|', '/', '-', '\\'};
+        int i = 0;
+        while (spinner_running) {
+            std::cout << "\r  " << frames[i++ % 4] << " " << spinner_label << std::flush;
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        }
+    });
+}
+
+void stop_spinner() {
+    if (!spinner_running) return;
+    spinner_running = false;
+    spinner_thread.join();
+    std::cout << "\r" << std::string(spinner_label.size() + 6, ' ') << "\r" << std::flush;
+}
 
 // runs a command, throws away the output, returns the exit code.
 // with --debug the output goes into the log file instead.
@@ -131,9 +168,14 @@ double read_score_from_log(const fs::path& log_file) {
     if (pooled_start == std::string::npos) return -1.0;
     size_t vmaf_key = contents.find("\"vmaf\"", pooled_start);
     if (vmaf_key == std::string::npos) return -1.0;
-    size_t mean_key = contents.find("\"mean\"", vmaf_key);
-    if (mean_key == std::string::npos) return -1.0;
-    size_t colon = contents.find(':', mean_key);
+
+    // harmonic mean rather than the plain mean. a clip can average 95 while a
+    // handful of frames fall apart, and the plain mean hides that completely.
+    // harmonic mean drags the score down when any frames are bad, which is the
+    // behaviour we want out of a quality floor.
+    size_t score_key = contents.find("\"harmonic_mean\"", vmaf_key);
+    if (score_key == std::string::npos) return -1.0;
+    size_t colon = contents.find(':', score_key);
     if (colon == std::string::npos) return -1.0;
 
     try { return std::stod(contents.substr(colon + 1)); } catch (...) { return -1.0; }
@@ -147,7 +189,13 @@ double measure_vmaf(const fs::path& original, const fs::path& encoded, const fs:
     // timestamp. obs records slightly variable framerate and we encode to constant,
     // so matching on timestamps lines frames up against their neighbours in places
     // and tanks the score on content that is otherwise fine.
-    std::string filter = "[0:v]settb=AVTB,setpts=N[dist];[1:v]settb=AVTB,setpts=N[ref];[dist][ref]libvmaf=log_fmt=json:log_path=" + log_file.filename().string();
+    //
+    // libvmaf also runs single threaded unless told otherwise, and scoring is by far
+    // the slowest part of a run. same score, roughly 5x faster.
+    unsigned int threads = std::thread::hardware_concurrency();
+    if (threads == 0) threads = 4;
+
+    std::string filter = "[0:v]settb=AVTB,setpts=N[dist];[1:v]settb=AVTB,setpts=N[ref];[dist][ref]libvmaf=n_threads=" + std::to_string(threads) + ":log_fmt=json:log_path=" + log_file.filename().string();
     std::string command = "ffmpeg -y -i \"" + encoded.string() + "\" -i \"" + original.string() + "\" -lavfi \"" + filter + "\" -f null -";
 
     fs::path previous_dir = fs::current_path();
@@ -221,7 +269,11 @@ ClipResult optimize_clip(const fs::path& source, const Settings& settings, const
     double duration = get_video_duration(source);
     fs::path original_sample = temp_dir / ("sample_orig" + source.extension().string());
 
-    if (!extract_sample(source, original_sample, duration)) {
+    start_spinner("extracting sample");
+    bool got_sample = extract_sample(source, original_sample, duration);
+    stop_spinner();
+
+    if (!got_sample) {
         std::cout << "  could not extract a sample, skipping\n";
         return result;
     }
@@ -234,9 +286,15 @@ ClipResult optimize_clip(const fs::path& source, const Settings& settings, const
         CrfTest test;
         test.crf = crf;
 
-        if (encode_video(original_sample, encoded_sample, settings, crf)) {
+        start_spinner("encoding crf " + std::to_string(crf));
+        bool encoded = encode_video(original_sample, encoded_sample, settings, crf);
+        stop_spinner();
+
+        if (encoded) {
             test.sample_size = fs::file_size(encoded_sample);
+            start_spinner("scoring crf " + std::to_string(crf));
             test.vmaf_score = measure_vmaf(original_sample, encoded_sample, vmaf_log);
+            stop_spinner();
             test.valid = test.vmaf_score >= 0.0;
         }
         tests.push_back(test);
@@ -265,7 +323,11 @@ ClipResult optimize_clip(const fs::path& source, const Settings& settings, const
     // when replacing we encode into the temp folder first, then swap it in
     fs::path output_file = settings.replace_originals ? temp_dir / source.filename() : output_folder / source.filename();
 
-    if (!encode_video(source, output_file, settings, winner.crf)) {
+    start_spinner("encoding full file at crf " + std::to_string(winner.crf));
+    bool encoded_full = encode_video(source, output_file, settings, winner.crf);
+    stop_spinner();
+
+    if (!encoded_full) {
         std::cout << "  full encode failed, skipping\n";
         return result;
     }

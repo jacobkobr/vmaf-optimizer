@@ -8,11 +8,24 @@ The problem is the right CRF depends on the footage. A quiet menu screen and a
 firefight compress completely differently, so one value across the whole library
 either wastes space on the easy clips or smears the busy ones.
 
-This measures instead of guessing. For each clip it cuts a 20 second sample, so
-it isn't re-encoding the whole file four times over, encodes that sample at a
-few CRF values, scores every one against the original with VMAF, and keeps the
-smallest file that still clears a quality floor. If nothing clears it, it falls
-back to the best score and says so in the report.
+Rather than settle on a single value, the tool determines one per clip. It
+extracts a 20 second sample so the search doesn't require re-encoding the full
+file at every step, encodes that sample across a range of CRF values, and scores
+each result against the source sample using VMAF, the perceptual quality metric
+Netflix developed to judge encode quality across their own catalog. The smallest
+encode that still meets the quality floor is applied to the full clip. If nothing
+reaches the floor, the highest scoring setting is used and the report marks the
+clip as having failed it.
+
+![example run](screenshot.png)
+
+In this example the clip dropped from 67 MB to 20 MB. CRF 28 would have been
+half that size again, but it scored too far under the floor, so 23 was used.
+
+About 70 seconds for a 15 second 1080p60 clip on a Ryzen 7 7700X. It's all CPU
+work, x264 and libvmaf never touch the GPU, so core count is what moves that
+number. The sweep always runs on a 20 second sample no matter how long the clip
+is, so past a minute or so the final encode is most of the wait.
 
 ## Requires
 
